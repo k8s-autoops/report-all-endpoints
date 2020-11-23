@@ -128,9 +128,9 @@ func scanHostNetwork(workload *ResultWorkload, pts corev1.PodTemplateSpec, nodes
 			if node.Name == hostname {
 				ip := getNodeIP(node)
 				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind:        "主机网络",
+					Kind:        "宿主机网络",
 					Address:     ip + " (" + node.Name + ")",
-					Port:        "端口未知，详见具体工作负载配置",
+					Port:        "端口未知，详见具体工作负载内部配置",
 					AccessColor: "danger",
 					Access:      "集群内,腾讯云内网",
 				})
@@ -140,7 +140,7 @@ func scanHostNetwork(workload *ResultWorkload, pts corev1.PodTemplateSpec, nodes
 	}
 
 	workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-		Kind:        "主机网络",
+		Kind:        "宿主机网络",
 		Address:     "主机未知，详见具体工作负载调度配置",
 		Port:        "端口未知，详见具体工作负载内部配置",
 		AccessColor: "danger",
