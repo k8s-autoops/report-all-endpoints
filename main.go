@@ -235,7 +235,7 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 				}
 				if len(ips) > 0 {
 					workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-						Kind:        "腾讯云负载均衡",
+						Kind:        "腾讯云 L4 负载均衡",
 						Address:     strings.Join(ips, ", "),
 						Port:        strings.Join(ports, ", "),
 						AccessColor: "success",
