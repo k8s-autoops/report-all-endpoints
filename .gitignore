@@ -13,3 +13,12 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# GoLand
+.idea/
+
+# Kubeconfigs
+kubeconfig.d/
+
+# Result.html
+result.html
