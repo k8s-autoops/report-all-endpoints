@@ -84,27 +84,29 @@
                                 </div>
                             </div>
                             {{range .Namespaces}}
-                                <div class="col-md-12 mt-2">
-                                    <div class="card text-white bg-primary">
-                                        <div class="card-body">
-                                            <h5 class="card-title card-text"><i
-                                                        class="fa fa-folder"></i>&nbsp;命名空间：{{.Name}}</h5>
+                                {{if .Workloads }}
+                                    <div class="col-md-12 mt-2">
+                                        <div class="card text-white bg-primary">
+                                            <div class="card-body">
+                                                <h5 class="card-title card-text"><i
+                                                            class="fa fa-folder"></i>&nbsp;命名空间：{{.Name}}</h5>
+                                            </div>
                                         </div>
                                     </div>
-                                </div>
-                                {{range .Workloads}}
-                                    <div class="col-md-12 mt-2">
-                                        <div class="card">
-                                            <div class="card-header">
-                                                <h5><i class="fa fa-cube"></i>&nbsp;<span
-                                                            class="text-muted">{{.Namespace}}</span>&nbsp;/&nbsp;{{.Name}}
-                                                    &nbsp;<small
-                                                            class="text-muted">({{.Kind}}，{{.Replicas}}个副本)</small></h5>
-                                            </div>
-                                            <ul class="list-group list-group-flush">
-                                                {{if .Endpoints}}
-                                                    {{range .Endpoints}}
-                                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                    {{range .Workloads}}
+                                        <div class="col-md-12 mt-2">
+                                            <div class="card">
+                                                <div class="card-header">
+                                                    <h5><i class="fa fa-cube"></i>&nbsp;<span
+                                                                class="text-muted">{{.Namespace}}</span>&nbsp;/&nbsp;{{.Name}}
+                                                        &nbsp;<small
+                                                                class="text-muted">({{.Kind}}，{{.Replicas}}个副本)</small>
+                                                    </h5>
+                                                </div>
+                                                <ul class="list-group list-group-flush">
+                                                    {{if .Endpoints}}
+                                                        {{range .Endpoints}}
+                                                            <li class="list-group-item d-flex justify-content-between align-items-center">
                                                             <span>
                                                                 <b>{{.Kind}}</b>
                                                                 <br/>
@@ -112,17 +114,18 @@
                                                                 <br/>
                                                                 端口: <code>{{if .Port}}{{.Port}}{{else}}任意{{end}}</code>
                                                             </span>
-                                                            <span class="badge badge-{{.AccessColor}} badge-pill">{{.Access}}</span>
+                                                                <span class="badge badge-{{.AccessColor}} badge-pill">{{.Access}}</span>
+                                                            </li>
+                                                        {{end}}
+                                                    {{else}}
+                                                        <li class="list-group-item d-flex justify-content-between align-items-center text-muted">
+                                                            无
                                                         </li>
                                                     {{end}}
-                                                {{else}}
-                                                    <li class="list-group-item d-flex justify-content-between align-items-center text-muted">
-                                                        无
-                                                    </li>
-                                                {{end}}
-                                            </ul>
+                                                </ul>
+                                            </div>
                                         </div>
-                                    </div>
+                                    {{end}}
                                 {{end}}
                             {{end}}
                         </div>
