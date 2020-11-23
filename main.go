@@ -75,11 +75,23 @@ type ResultWorkload struct {
 }
 
 type ResultEndpoint struct {
-	Kind        string
-	Address     string
-	Port        string
-	AccessColor string
-	Access      string
+	Kind   string
+	Desc   string
+	Hosts  []ResultHost
+	Ports  []ResultPort
+	Color  string
+	Access string
+}
+
+type ResultHost struct {
+	DNS string
+	IP  string
+}
+
+type ResultPort struct {
+	From     string
+	To       string
+	Protocol string
 }
 
 var (
@@ -98,6 +110,23 @@ func matchSelector(selector, labels map[string]string) bool {
 		}
 	}
 	return true
+}
+
+func convertServiceToResultPorts(service corev1.Service, nodePort bool) (ports []ResultPort) {
+	for _, port := range service.Spec.Ports {
+		var sourcePort string
+		if nodePort {
+			sourcePort = fmt.Sprintf("%d", port.NodePort)
+		} else {
+			sourcePort = fmt.Sprintf("%d", port.Port)
+		}
+		ports = append(ports, ResultPort{
+			From:     sourcePort,
+			To:       port.TargetPort.String(),
+			Protocol: string(port.Protocol),
+		})
+	}
+	return
 }
 
 func scanHostNetwork(workload *ResultWorkload, pts corev1.PodTemplateSpec, nodes *corev1.NodeList) {
@@ -123,57 +152,58 @@ func scanHostNetwork(workload *ResultWorkload, pts corev1.PodTemplateSpec, nodes
 			}
 		}
 	}
+
+	ep := ResultEndpoint{
+		Kind:   "HostNetwork",
+		Desc:   "容器直接运行在宿主机网络栈上",
+		Hosts:  []ResultHost{{}},
+		Ports:  []ResultPort{{}},
+		Color:  "danger",
+		Access: "集群内网可访问,腾讯云内网可访问",
+	}
+
 	if hostname != "" {
 		for _, node := range nodes.Items {
 			if node.Name == hostname {
 				ip := getNodeIP(node)
-				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind:        "宿主机网络",
-					Address:     ip + " (" + node.Name + ")",
-					Port:        "端口未知，详见具体工作负载内部配置",
-					AccessColor: "danger",
-					Access:      "集群内,腾讯云内网",
-				})
-				return
+				ep.Hosts[0] = ResultHost{
+					DNS: node.Name,
+					IP:  ip,
+				}
 			}
 		}
 	}
 
-	workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-		Kind:        "宿主机网络",
-		Address:     "主机未知，详见具体工作负载调度配置",
-		Port:        "端口未知，详见具体工作负载内部配置",
-		AccessColor: "danger",
-		Access:      "集群内,腾讯云内网",
-	})
+	workload.Endpoints = append(workload.Endpoints, ep)
 }
 
 func scanTKEFixedIP(workload *ResultWorkload, namespace string, pts corev1.PodTemplateSpec, pods *corev1.PodList, podSelector map[string]string) {
 	if pts.Annotations != nil &&
 		pts.Annotations["tke.cloud.tencent.com/vpc-ip-claim-delete-policy"] == "Never" {
-		var podIPs []string
+		var hosts []ResultHost
 		for _, pod := range pods.Items {
 			if pod.Namespace != namespace {
 				continue
 			}
 			if matchSelector(podSelector, pod.Labels) {
 				if pod.Status.PodIP != "" {
-					podIPs = append(podIPs, pod.Status.PodIP)
+					hosts = append(hosts, ResultHost{IP: pod.Status.PodIP})
 				}
 			}
 		}
-		if len(podIPs) != 0 {
+		if len(hosts) != 0 {
 			workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-				Kind:        "Pod IP (固定)",
-				Address:     strings.Join(podIPs, ", "),
-				AccessColor: "success",
-				Access:      "腾讯云内网",
+				Kind:   "固定 PodIP",
+				Desc:   "TKE 集群特有功能，允许 Statefulset 类型工作负载的 Pod 重建后 IP 不发生变化",
+				Hosts:  hosts,
+				Color:  "success",
+				Access: "腾讯云内网可访问",
 			})
 		}
 	}
 }
 
-func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTemplateSpec, nodePortNodes []string, services *corev1.ServiceList) {
+func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTemplateSpec, nodePortHosts []ResultHost, services *corev1.ServiceList) {
 	for _, service := range services.Items {
 		if service.Namespace != namespace {
 			continue
@@ -184,62 +214,56 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 		if service.Spec.Type == corev1.ServiceTypeClusterIP {
 			if service.Spec.ClusterIP == corev1.ClusterIPNone {
 				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind:        "Pod IP (通过集群内 DNS 枚举)",
-					Address:     service.Name + "." + service.Namespace,
-					AccessColor: "secondary",
-					Access:      "集群内",
+					Kind: "PodIP",
+					Desc: "仅在集群内网可访问有效，可以访问全部端口，随 Pod 重建而变化，必须每次使用集群内网域名进行解析",
+					Hosts: []ResultHost{
+						{
+							DNS: service.Name + "." + service.Namespace,
+						},
+					},
+					Color:  "secondary",
+					Access: "集群内网可访问",
 				})
 			} else {
-				var ports []string
-				for _, port := range service.Spec.Ports {
-					ports = append(ports, fmt.Sprintf("%d/%s->%s/%s", port.Port, port.Protocol, port.TargetPort.String(), port.Protocol))
-				}
 				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind:        "Cluster IP",
-					Address:     service.Spec.ClusterIP,
-					Port:        strings.Join(ports, ", "),
-					AccessColor: "secondary",
-					Access:      "集群内",
-				})
-				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind:        "Cluster IP (通过集群内 DNS 解析)",
-					Address:     service.Name + "." + service.Namespace,
-					Port:        strings.Join(ports, ", "),
-					AccessColor: "secondary",
-					Access:      "集群内",
+					Kind: "ClusterIP",
+					Desc: "仅在集群内网可访问有效，必须声明工作负载端口，不随 Pod 重建而变化，建议使用集群内网域名进行解析",
+					Hosts: []ResultHost{
+						{
+							IP:  service.Spec.ClusterIP,
+							DNS: service.Name + "." + service.Namespace,
+						},
+					},
+					Ports:  convertServiceToResultPorts(service, false),
+					Color:  "secondary",
+					Access: "集群内网可访问",
 				})
 			}
 		}
-		if len(nodePortNodes) != 0 && service.Spec.Type == corev1.ServiceTypeNodePort {
-			var ports []string
-			for _, port := range service.Spec.Ports {
-				ports = append(ports, fmt.Sprintf("%d/%s->%s/%s", port.NodePort, port.Protocol, port.TargetPort.String(), port.Protocol))
-			}
+		if len(nodePortHosts) != 0 && service.Spec.Type == corev1.ServiceTypeNodePort {
 			workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-				Kind:        "NodePort",
-				Address:     strings.Join(nodePortNodes, ", ") + " 任选一个",
-				Port:        strings.Join(ports, ", "),
-				AccessColor: "success",
-				Access:      "腾讯云内网",
+				Kind:   "NodePort",
+				Desc:   "集群所有宿主机的某个端口，都指向该工作负载服务的特定端口，必须声明工作负载端口，宿主机端口建议随机防止冲突，访问时任选一个主机 IP 即可",
+				Hosts:  nodePortHosts,
+				Ports:  convertServiceToResultPorts(service, true),
+				Color:  "success",
+				Access: "腾讯云内网可访问",
 			})
 		}
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
 			if service.Annotations != nil && service.Annotations["service.kubernetes.io/loadbalance-id"] != "" {
-				var ports []string
-				for _, port := range service.Spec.Ports {
-					ports = append(ports, fmt.Sprintf("%d/%s->%s/%s", port.Port, port.Protocol, port.TargetPort.String(), port.Protocol))
-				}
-				var ips []string
+				var hosts []ResultHost
 				for _, ing := range service.Status.LoadBalancer.Ingress {
-					ips = append(ips, ing.IP)
+					hosts = append(hosts, ResultHost{IP: ing.IP, DNS: ing.Hostname})
 				}
-				if len(ips) > 0 {
+				if len(hosts) > 0 {
 					workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-						Kind:        "腾讯云 L4 负载均衡",
-						Address:     strings.Join(ips, ", "),
-						Port:        strings.Join(ports, ", "),
-						AccessColor: "success",
-						Access:      "腾讯云内网",
+						Kind:   "腾讯云L4负载均衡",
+						Desc:   "TKE 特有功能",
+						Hosts:  hosts,
+						Ports:  convertServiceToResultPorts(service, false),
+						Color:  "success",
+						Access: "腾讯云内网可访问",
 					})
 				}
 			}
@@ -276,7 +300,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 		return
 	}
 
-	var nodePortNodes []string
+	var nodePortHosts []ResultHost
 
 	for _, node := range nodes.Items {
 		sfnp := false
@@ -285,7 +309,9 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 		}
 		ip := getNodeIP(node)
 		if sfnp {
-			nodePortNodes = append(nodePortNodes, ip)
+			nodePortHosts = append(nodePortHosts, ResultHost{
+				IP: ip,
+			})
 		}
 		rc.Nodes = append(rc.Nodes, ResultNode{
 			Name:                node.Name,
@@ -339,7 +365,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 			workload.Replicas = int(*deployment.Spec.Replicas)
 
 			scanHostNetwork(&workload, deployment.Spec.Template, nodes)
-			scanService(&workload, deployment.Namespace, deployment.Spec.Template, nodePortNodes, services)
+			scanService(&workload, deployment.Namespace, deployment.Spec.Template, nodePortHosts, services)
 
 			namespace.Workloads = append(namespace.Workloads, workload)
 		}
@@ -356,7 +382,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 
 			scanHostNetwork(&workload, statefulset.Spec.Template, nodes)
 			scanTKEFixedIP(&workload, statefulset.Namespace, statefulset.Spec.Template, pods, statefulset.Spec.Selector.MatchLabels)
-			scanService(&workload, statefulset.Namespace, statefulset.Spec.Template, nodePortNodes, services)
+			scanService(&workload, statefulset.Namespace, statefulset.Spec.Template, nodePortHosts, services)
 
 			namespace.Workloads = append(namespace.Workloads, workload)
 		}
