@@ -9,7 +9,7 @@ import (
 	"io/ioutil"
 	appv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -75,12 +75,13 @@ type ResultWorkload struct {
 }
 
 type ResultEndpoint struct {
-	Kind   string
-	Desc   string
-	Hosts  []ResultHost
-	Ports  []ResultPort
-	Color  string
-	Access string
+	Kind        string
+	Description string
+	Notice      template.HTML
+	Hosts       []ResultHost
+	Ports       []ResultPort
+	Color       string
+	Access      string
 }
 
 type ResultHost struct {
@@ -99,6 +100,18 @@ var (
 	optOutput   string
 	optTemplate string
 )
+
+func renderList(items ...string) string {
+	sb := &strings.Builder{}
+	//sb.WriteString("<ul>")
+	for _, item := range items {
+		sb.WriteString("<li>")
+		sb.WriteString(item)
+		sb.WriteString("</li>")
+	}
+	//sb.WriteString("</ul>")
+	return sb.String()
+}
 
 func matchSelector(selector, labels map[string]string) bool {
 	if selector == nil {
@@ -154,12 +167,12 @@ func scanHostNetwork(workload *ResultWorkload, pts corev1.PodTemplateSpec, nodes
 	}
 
 	ep := ResultEndpoint{
-		Kind:   "HostNetwork",
-		Desc:   "容器直接运行在宿主机网络栈上",
-		Hosts:  []ResultHost{{}},
-		Ports:  []ResultPort{{}},
-		Color:  "danger",
-		Access: "集群内网可访问,腾讯云内网可访问",
+		Kind:        "HostNetwork",
+		Description: renderList("容器直接运行在宿主机网络栈上"),
+		Hosts:       []ResultHost{{}},
+		Ports:       []ResultPort{{}},
+		Color:       "danger",
+		Access:      "集群内网访问,腾讯云内网访问",
 	}
 
 	if hostname != "" {
@@ -193,61 +206,151 @@ func scanTKEFixedIP(workload *ResultWorkload, namespace string, pts corev1.PodTe
 		}
 		if len(hosts) != 0 {
 			workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-				Kind:   "固定 PodIP",
-				Desc:   "TKE 集群特有功能，允许 Statefulset 类型工作负载的 Pod 重建后 IP 不发生变化",
-				Hosts:  hosts,
-				Color:  "success",
-				Access: "腾讯云内网可访问",
+				Kind:        "PodIP (固定)",
+				Description: renderList("TKE 集群特有功能", "允许 Statefulset 类型工作负载的 Pod 重建后 IP 不发生变化"),
+				Hosts:       hosts,
+				Color:       "success",
+				Access:      "腾讯云内网访问",
 			})
 		}
 	}
 }
 
-func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTemplateSpec, nodePortHosts []ResultHost, services *corev1.ServiceList) {
+func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTemplateSpec, nodePortHosts []ResultHost, services *corev1.ServiceList, pods *corev1.PodList, ingresses *extensionsv1beta1.IngressList) {
+	// 依据 Pod 来扩展 Labels，这个是 Rancher 特有的工作模式
+	expandedLabels := map[string]string{}
+
+	for k, v := range pts.Labels {
+		expandedLabels[k] = v
+	}
+
+	for _, pod := range pods.Items {
+		if pod.Namespace != namespace {
+			continue
+		}
+		if !matchSelector(pts.Labels, pod.Labels) {
+			continue
+		}
+		for k, v := range pod.Labels {
+			if strings.HasPrefix(k, "workloadID_ingress-") {
+				expandedLabels[k] = v
+			}
+		}
+	}
+
 	for _, service := range services.Items {
 		if service.Namespace != namespace {
 			continue
 		}
-		if !matchSelector(service.Spec.Selector, pts.Labels) {
+		if !matchSelector(service.Spec.Selector, expandedLabels) {
 			continue
 		}
+		matchByExpanded := !matchSelector(service.Spec.Selector, pts.Labels)
 		if service.Spec.Type == corev1.ServiceTypeClusterIP {
 			if service.Spec.ClusterIP == corev1.ClusterIPNone {
 				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind: "PodIP",
-					Desc: "仅在集群内网可访问有效，可以访问全部端口，随 Pod 重建而变化，必须每次使用集群内网域名进行解析",
+					Kind:        "PodIP",
+					Description: renderList("IP 随 Pod 重建而变化，必须每次使用集群内网域名进行解析", "可以访问全部端口"),
 					Hosts: []ResultHost{
 						{
 							DNS: service.Name + "." + service.Namespace,
 						},
 					},
 					Color:  "secondary",
-					Access: "集群内网可访问",
+					Access: "集群内网访问",
 				})
 			} else {
-				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-					Kind: "ClusterIP",
-					Desc: "仅在集群内网可访问有效，必须声明工作负载端口，不随 Pod 重建而变化，建议使用集群内网域名进行解析",
-					Hosts: []ResultHost{
-						{
-							IP:  service.Spec.ClusterIP,
-							DNS: service.Name + "." + service.Namespace,
+				if !matchByExpanded {
+					workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
+						Kind:        "ClusterIP",
+						Description: renderList("IP 不随 Pod 重建而变化，仍然建议使用集群内网域名进行解析", "只访问声明的端口"),
+						Hosts: []ResultHost{
+							{
+								IP:  service.Spec.ClusterIP,
+								DNS: service.Name + "." + service.Namespace,
+							},
 						},
-					},
-					Ports:  convertServiceToResultPorts(service, false),
-					Color:  "secondary",
-					Access: "集群内网可访问",
-				})
+						Ports:  convertServiceToResultPorts(service, false),
+						Color:  "secondary",
+						Access: "集群内网访问",
+					})
+				}
+
+				for _, ingress := range ingresses.Items {
+					if ingress.Namespace != namespace {
+						continue
+					}
+					for _, rule := range ingress.Spec.Rules {
+						if rule.IngressRuleValue.HTTP == nil {
+							continue
+						}
+						scheme := "http://"
+						sourcePort := "80"
+						for _, tls := range ingress.Spec.TLS {
+							for _, host := range tls.Hosts {
+								if host == rule.Host {
+									scheme = "https://"
+									sourcePort = "443"
+								}
+							}
+						}
+
+						for _, path := range rule.HTTP.Paths {
+							if path.Backend.ServiceName == service.Name {
+								if matchByExpanded {
+									workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
+										Kind:        "Ingress (Rancher)",
+										Description: renderList("Rancher 特有的 Ingress 条目", "添加 Ingress 记录时自动生成 ClusterIP 条目"),
+										Notice:      `正常情况下，创建 Ingress 条目<b>必须先创建</b> ClusterIP 端口规则，并<b>只能选择</b>声明的端口<br/>虽然 Rancher 的 <b>负载均衡</b> 页面允许你直接添加 <b>工作负载</b> 并填写 <b>任意端口</b>，但这会<b>自动产生冗余的 ClusterIP 条目</b><br/>建议<b>不要</b>在 <b>负载均衡</b> 页面使用 <b>[+负载均衡]</b> 按钮，改为手动为 <b>工作负载</b> 配置 <b>ClusterIP 端口规则</b>，然后使用 <b>[+服务]</b> 按钮`,
+										Hosts: []ResultHost{
+											{
+												DNS: scheme + rule.Host + path.Path,
+											},
+										},
+										Ports: []ResultPort{
+											{
+												From:     sourcePort,
+												To:       path.Backend.ServicePort.String(),
+												Protocol: string(corev1.ProtocolTCP),
+											},
+										},
+										Color:  "warning",
+										Access: "公网访问",
+									})
+								} else {
+									workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
+										Kind:        "Ingress",
+										Description: renderList("Ingress 代表 L7 负载均衡条目，基于<b>域名</b>和<b>路径前缀</b>路由到不同的工作负载", "根据集群部署方式不同，集群会针对 Ingress 规则，更新集群入口 Nginx 配置，或者生成腾讯云公网负载均衡"),
+										Hosts: []ResultHost{
+											{
+												DNS: scheme + rule.Host + path.Path,
+											},
+										},
+										Ports: []ResultPort{
+											{
+												From:     sourcePort,
+												To:       path.Backend.ServicePort.String(),
+												Protocol: string(corev1.ProtocolTCP),
+											},
+										},
+										Color:  "warning",
+										Access: "公网访问",
+									})
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 		if len(nodePortHosts) != 0 && service.Spec.Type == corev1.ServiceTypeNodePort {
 			workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-				Kind:   "NodePort",
-				Desc:   "集群所有宿主机的某个端口，都指向该工作负载服务的特定端口，必须声明工作负载端口，宿主机端口建议随机防止冲突，访问时任选一个主机 IP 即可",
-				Hosts:  nodePortHosts,
-				Ports:  convertServiceToResultPorts(service, true),
-				Color:  "success",
-				Access: "腾讯云内网可访问",
+				Kind:        "NodePort",
+				Description: renderList("将集群<b>所有</b>宿主机的指定端口映射到<b>工作负载</b>的指定端口", "创建 NodePort 端口规则时，宿主机端口建议随机选择以防止冲突", "访问时任选一个主机 IP 即可"),
+				Hosts:       nodePortHosts,
+				Ports:       convertServiceToResultPorts(service, true),
+				Color:       "success",
+				Access:      "腾讯云内网访问",
 			})
 		}
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
@@ -258,12 +361,12 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 				}
 				if len(hosts) > 0 {
 					workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-						Kind:   "腾讯云L4负载均衡",
-						Desc:   "TKE 特有功能",
-						Hosts:  hosts,
-						Ports:  convertServiceToResultPorts(service, false),
-						Color:  "success",
-						Access: "腾讯云内网可访问",
+						Kind:        "腾讯云L4负载均衡",
+						Description: renderList("TKE 特有功能"),
+						Hosts:       hosts,
+						Ports:       convertServiceToResultPorts(service, false),
+						Color:       "success",
+						Access:      "腾讯云内网访问",
 					})
 				}
 			}
@@ -328,7 +431,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 	if services, err = client.CoreV1().Services("").List(context.Background(), metav1.ListOptions{}); err != nil {
 		return
 	}
-	var ingresses *v1beta1.IngressList
+	var ingresses *extensionsv1beta1.IngressList
 	if ingresses, err = client.ExtensionsV1beta1().Ingresses("").List(context.Background(), metav1.ListOptions{}); err != nil {
 		return
 	}
@@ -365,7 +468,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 			workload.Replicas = int(*deployment.Spec.Replicas)
 
 			scanHostNetwork(&workload, deployment.Spec.Template, nodes)
-			scanService(&workload, deployment.Namespace, deployment.Spec.Template, nodePortHosts, services)
+			scanService(&workload, deployment.Namespace, deployment.Spec.Template, nodePortHosts, services, pods, ingresses)
 
 			namespace.Workloads = append(namespace.Workloads, workload)
 		}
@@ -382,7 +485,7 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 
 			scanHostNetwork(&workload, statefulset.Spec.Template, nodes)
 			scanTKEFixedIP(&workload, statefulset.Namespace, statefulset.Spec.Template, pods, statefulset.Spec.Selector.MatchLabels)
-			scanService(&workload, statefulset.Namespace, statefulset.Spec.Template, nodePortHosts, services)
+			scanService(&workload, statefulset.Namespace, statefulset.Spec.Template, nodePortHosts, services, pods, ingresses)
 
 			namespace.Workloads = append(namespace.Workloads, workload)
 		}
@@ -428,6 +531,8 @@ func main() {
 			return
 		}
 		result.Clusters = append(result.Clusters, rc)
+
+		break
 	}
 
 	var buf []byte
