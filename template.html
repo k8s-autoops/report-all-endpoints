@@ -112,14 +112,14 @@
                                                                 <span class="badge badge-{{$color}} badge-pill">{{.Access}}</span>
                                                                 <br/>
                                                                 {{if .Notice}}
-                                                                    <small class="text-muted">{{.Notice}}</small>
+                                                                    <small class="text-muted"><b>提示:</b> {{.Notice}}</small>
                                                                     <br/>
                                                                 {{end}}
                                                                 {{range .Hosts}}
                                                                     <b>
                                                                     {{if .DNS }}
                                                                         {{if .IP}}
-                                                                            <code>{{.DNS}} / {{.IP}}</code>
+                                                                            <code>{{.DNS}} [{{.IP}}]</code>
                                                                         {{ else }}
                                                                             <code>{{.DNS}}</code>
                                                                         {{ end }}

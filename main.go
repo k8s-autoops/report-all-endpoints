@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,17 +24,23 @@ import (
 	"time"
 )
 
+const (
+	TKEHTTPRules    = "kubernetes.io/ingress.http-rules"
+	TKEHTTPsRules   = "kubernetes.io/ingress.https-rules"
+	TKEDirectAccess = "ingress.cloud.tencent.com/direct-access"
+)
+
 var (
-	hiddenNamespaces = map[string]bool{
-		"autoops":                true,
-		"cattle-prometheus":      true,
-		"cattle-system":          true,
-		"kube-system":            true,
-		"kube-public":            true,
-		"kube-node-lease":        true,
-		"nginx-ingress":          true,
-		"ingress-nginx":          true,
-		"nfs-client-provisioner": true,
+	hiddenNamespaces = []string{
+		"autoops",
+		"cattle-prometheus",
+		"cattle-system",
+		"kube-system",
+		"kube-public",
+		"kube-node-lease",
+		"nginx-ingress",
+		"ingress-nginx",
+		"nfs-client-provisioner",
 	}
 )
 
@@ -41,6 +49,15 @@ func exit(err *error) {
 		log.Println("exited with error:", (*err).Error())
 		os.Exit(1)
 	}
+}
+
+type HTTPRule struct {
+	Host    string `json:"host,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Backend struct {
+		ServiceName string `json:"serviceName"`
+		ServicePort string `json:"servicePort"`
+	} `json:"backend,omitempty"`
 }
 
 type Result struct {
@@ -242,14 +259,20 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 		if service.Namespace != namespace {
 			continue
 		}
+
 		if !matchSelector(service.Spec.Selector, expandedLabels) {
 			continue
 		}
+
+		// 无法使用标准 Labels 匹配，但是可以使用扩展 Labels 匹配，说明 扩展 Labels 与标准 Labels 不一样
 		matchByExpanded := !matchSelector(service.Spec.Selector, pts.Labels)
+
 		if service.Spec.Type == corev1.ServiceTypeClusterIP {
 			if service.Spec.ClusterIP == corev1.ClusterIPNone {
+				// Headless ClusterIP 模式
 				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
 					Kind:        "PodIP",
+					Notice:      "建议添加 ClusterIP 端口规则，提供更稳定的集群内网连接",
 					Description: renderList("IP 随 Pod 重建而变化，必须每次使用集群内网域名进行解析", "可以访问全部端口"),
 					Hosts: []ResultHost{
 						{
@@ -260,10 +283,12 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 					Access: "集群内网访问",
 				})
 			} else {
+				// 正常 ClusterIP 模式
+				// 忽略 Rancher 扩展的 ClusterIP 服务
 				if !matchByExpanded {
 					workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
 						Kind:        "ClusterIP",
-						Description: renderList("IP 不随 Pod 重建而变化，仍然建议使用集群内网域名进行解析", "只访问声明的端口"),
+						Description: renderList("IP 不随 Pod 重建而变化，仍然建议使用集群内网域名进行解析", "只能访问声明的端口"),
 						Hosts: []ResultHost{
 							{
 								IP:  service.Spec.ClusterIP,
@@ -276,10 +301,12 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 					})
 				}
 
+				// 查询 Ingress 条目
 				for _, ingress := range ingresses.Items {
 					if ingress.Namespace != namespace {
 						continue
 					}
+
 					for _, rule := range ingress.Spec.Rules {
 						if rule.IngressRuleValue.HTTP == nil {
 							continue
@@ -343,16 +370,114 @@ func scanService(workload *ResultWorkload, namespace string, pts corev1.PodTempl
 				}
 			}
 		}
-		if len(nodePortHosts) != 0 && service.Spec.Type == corev1.ServiceTypeNodePort {
-			workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
-				Kind:        "NodePort",
-				Description: renderList("将集群<b>所有</b>宿主机的指定端口映射到<b>工作负载</b>的指定端口", "创建 NodePort 端口规则时，宿主机端口建议随机选择以防止冲突", "访问时任选一个主机 IP 即可"),
-				Hosts:       nodePortHosts,
-				Ports:       convertServiceToResultPorts(service, true),
-				Color:       "success",
-				Access:      "腾讯云内网访问",
-			})
+		if service.Spec.Type == corev1.ServiceTypeNodePort {
+			// 查询腾讯云特有的 Ingress 条目
+			for _, ingress := range ingresses.Items {
+				if ingress.Namespace != service.Namespace {
+					continue
+				}
+				if ingress.Annotations != nil &&
+					(ingress.Annotations[TKEHTTPRules] != "" || ingress.Annotations[TKEHTTPsRules] != "") {
+
+					dr, _ := strconv.ParseBool(ingress.Annotations[TKEDirectAccess])
+
+					collectRules := func(rules []HTTPRule, https bool) {
+						for _, rule := range rules {
+							if rule.Backend.ServiceName == service.Name {
+								var (
+									ip     string
+									kind   string
+									color  string
+									access string
+								)
+								if len(ingress.Status.LoadBalancer.Ingress) > 0 {
+									ip = ingress.Status.LoadBalancer.Ingress[0].IP
+								}
+								if ip == "" {
+									kind = "Ingress (TKE L7 负载均衡)"
+									color = "secondary"
+									access = "公网 或 腾讯云内网访问"
+								} else {
+									if isPrivateIP(net.ParseIP(ip)) {
+										kind = "Ingress (TKE L7 内网负载均衡)"
+										color = "success"
+										access = "腾讯云内网访问"
+									} else {
+										kind = "Ingress (TKE L7 公网负载均衡)"
+										color = "warning"
+										access = "公网访问"
+									}
+								}
+								if dr {
+									kind = kind + " [直连]"
+								}
+								host := rule.Host
+								if host == "" {
+									host = ip
+								}
+								scheme := "http://"
+								if https {
+									scheme = "https://"
+								}
+								port := "80"
+								if https {
+									port = "443"
+								}
+								workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
+									Kind:        kind,
+									Notice:      `需要提前创建 NodePort 类型的端口规则，必须在腾讯云管理台进行维护，请勿在 Rancher 管理台维护`,
+									Description: renderList("TKE 特有功能", "必须在腾讯云管理台维护"),
+									Hosts: []ResultHost{
+										{
+											DNS: scheme + host + rule.Path,
+											IP:  ip,
+										},
+									},
+									Ports: []ResultPort{
+										{
+											From:     port,
+											To:       rule.Backend.ServicePort,
+											Protocol: string(corev1.ProtocolTCP),
+										},
+									},
+									Color:  color,
+									Access: access,
+								})
+							}
+						}
+					}
+
+					var rules []HTTPRule
+					if ingress.Annotations[TKEHTTPRules] != "" {
+						if err := json.Unmarshal([]byte(ingress.Annotations[TKEHTTPRules]), &rules); err != nil {
+							log.Println("遭遇 TKE Ingress http-rules JSON解析错误:", err.Error())
+						} else {
+							collectRules(rules, false)
+						}
+					}
+					rules = nil
+					if ingress.Annotations[TKEHTTPsRules] != "" {
+						if err := json.Unmarshal([]byte(ingress.Annotations[TKEHTTPsRules]), &rules); err != nil {
+							log.Println("遭遇 TKE Ingress http-rules JSON解析错误:", err.Error())
+						} else {
+							collectRules(rules, true)
+						}
+					}
+				}
+			}
+
+			if len(nodePortHosts) > 0 {
+				workload.Endpoints = append(workload.Endpoints, ResultEndpoint{
+					Kind:        "NodePort",
+					Description: renderList("将集群<b>所有</b>宿主机的指定端口映射到<b>工作负载</b>的指定端口", "创建 NodePort 端口规则时，宿主机端口建议随机选择以防止冲突", "访问时任选一个主机 IP 即可"),
+					Hosts:       nodePortHosts,
+					Ports:       convertServiceToResultPorts(service, true),
+					Color:       "success",
+					Access:      "腾讯云内网访问",
+				})
+			}
 		}
+
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
 			if service.Annotations != nil && service.Annotations["service.kubernetes.io/loadbalance-id"] != "" {
 				var hosts []ResultHost
@@ -450,10 +575,14 @@ func generateSummary(kubeconfig, name, desc string) (rc ResultCluster, err error
 
 	_ = ingresses
 
+outerLoop:
 	for _, _namespace := range namespaces.Items {
-		if hiddenNamespaces[_namespace.Name] {
-			continue
+		for _, hns := range hiddenNamespaces {
+			if strings.HasPrefix(_namespace.Name, hns) {
+				continue outerLoop
+			}
 		}
+
 		var namespace ResultNamespace
 		namespace.Name = _namespace.Name
 
