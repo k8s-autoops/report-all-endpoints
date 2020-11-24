@@ -531,8 +531,6 @@ func main() {
 			return
 		}
 		result.Clusters = append(result.Clusters, rc)
-
-		break
 	}
 
 	var buf []byte
